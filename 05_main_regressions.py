@@ -91,8 +91,8 @@ log = logging.getLogger(__name__)
 # CONFIGURATION
 # ---------------------------------------------------------------------------
 
-INPUT_PATH   = "/content/drive/MyDrive/(H)edging Paper/ticker_day_ff5.parquet"
-OUTPUT_DIR   = "/content/drive/MyDrive/(H)edging Paper/Results/Script05"
+INPUT_PATH = r"C:\Users\cooln\Documents\ECG 755\ticker_day_ff5.parquet"
+OUTPUT_DIR = r"C:\Users\cooln\Documents\ECG 755\Results\Script05"
 
 BURN_IN_END  = "2018-12-31"   # 3-year burn-in per proposal
 N_CV_SPLITS  = 5              # time-series CV folds for ElasticNet
@@ -108,37 +108,30 @@ SHAP_SAMPLE  = 10_000         # rows for SHAP (proposal Section I)
 
 # Family 1: Modality markers
 MODALITY_FEATURES = [
-    "modal_count",
+    "has_modal_any",
 ]
 
 # Family 2: Negation features
 NEGATION_FEATURES = [
-    "negation_count",
-    "negation_scope",
     "has_negation_any",
 ]
 
 # Family 3: Hedging phrases
 HEDGING_FEATURES = [
-    "hedge_count",
     "hedge_intensity_mean",
     "uncertainty_mean",
 ]
 
 # Family 4: Uncertainty markers
 UNCERTAINTY_FEATURES = [
-    "uncertainty_count",
-    "uncertainty_index",
     "has_question_any",
-    "evidential_count",
 ]
 
 # Family 5: Ambiguity structure
 AMBIGUITY_FEATURES = [
-    "punctuation_density",
-    "has_parenthetical",
     "sentiment_std",
     "sentiment_range",
+    "is_market_wide_any",
 ]
 
 # Family 6: Firm-day aggregation
@@ -152,9 +145,10 @@ AGGREGATION_FEATURES = [
     "news_volume_shock",
     "relative_sentiment",
     "sentiment_mean",
-    "sentiment_confidence" if "sentiment_confidence" in [] else None,
+    "premarket_sentiment",
+    "mkt_sentiment",
+    "after_sentiment",
 ]
-AGGREGATION_FEATURES = [f for f in AGGREGATION_FEATURES if f is not None]
 
 ALL_TEXT_FEATURES = (
     MODALITY_FEATURES +
@@ -171,11 +165,11 @@ FINANCE_CONTROLS = [
     "prior_return_5d",
     "prior_return_20d",
     "realized_vol_20d",
-    "log_n_headlines",       # attention proxy
+    "log_n_headlines",
 ]
 
-# Primary uncertainty score for H1/H2 (composite)
-UNCERTAINTY_SCORE = "uncertainty_index"
+# Primary uncertainty score for H1/H2
+UNCERTAINTY_SCORE = "uncertainty_mean"
 
 # Family labels for SHAP attribution
 FAMILY_MAP = {}
@@ -909,17 +903,26 @@ def run_rolling_oos(df: pd.DataFrame,
     log.info(f"\nOverall OOS R²:          {overall_r2:.4f}")
     log.info(f"Overall directional acc: {overall_dir:.3f}")
 
-    # Attach predictions to test set for portfolio sorts
-    df_test_full = df[df["trading_day"] > BURN_IN_END].copy()
-    df_test_full = df_test_full.iloc[:len(all_preds)].copy()
-    df_test_full["oos_prediction"] = all_preds
+    # Build aligned test dataframe from rolling OOS results
+    oos_df = df[df["trading_day"] > BURN_IN_END].copy().reset_index(drop=True)
+    oos_df = oos_df.iloc[:len(all_preds)].copy()
+    oos_df["oos_prediction"] = all_preds
+
+    # Shift predictions forward by 1 day to prevent look-ahead
+    # Prediction on day t should only be used to trade on day t+1
+    oos_df["oos_prediction"] = oos_df.groupby("ticker_clean")["oos_prediction"].shift(1)
+
+    oos_df = df[df["trading_day"] > BURN_IN_END].copy().reset_index(drop=True)
+    oos_df = oos_df.iloc[:len(all_preds)].copy()
+    oos_df["oos_prediction"] = all_preds
+    oos_df["oos_prediction"] = oos_df.groupby("ticker_clean")["oos_prediction"].shift(1)
 
     return {
         "overall_r2":   overall_r2,
         "overall_dir":  overall_dir,
         "predictions":  all_preds,
         "actuals":      all_actuals,
-        "df_test_full": df_test_full,
+        "df_test_full": oos_df,
     }
 
 
@@ -1036,17 +1039,28 @@ def main():
     log.info("\n" + "="*60)
     results["fama_macbeth"] = run_fama_macbeth(df)
 
-    # --- Rolling OOS ---
+    # --- Rolling OOS (DA prediction, primary inference) ---
     log.info("\n" + "="*60)
-    log.info("Running rolling OOS framework...")
-    results["rolling_oos"] = run_rolling_oos(df)
+    log.info("Running rolling OOS framework (target=DA)...")
+    results["rolling_oos"] = run_rolling_oos(df, target="DA_primary")
 
-    # --- Portfolio sorts (using OOS predictions) ---
-    if "rolling_oos" in results and "df_test_full" in results["rolling_oos"]:
+    # --- Rolling OOS (CAR_post prediction, for portfolio sorts) ---
+    log.info("\n" + "="*60)
+    log.info("Running rolling OOS framework (target=CAR_post, for portfolios)...")
+    results["rolling_oos_port"] = run_rolling_oos(df, target="CAR_post_primary")
+
+    if "rolling_oos_port" in results and "df_test_full" in results["rolling_oos_port"]:
         log.info("\n" + "="*60)
-        df_test_full = results["rolling_oos"]["df_test_full"]
-        preds        = results["rolling_oos"]["predictions"]
-        results["portfolio"] = run_portfolio_sorts(df_test_full, preds)
+        oos_df = df[df["trading_day"] > BURN_IN_END].copy().reset_index(drop=True)
+        oos_df = oos_df.iloc[:len(results["rolling_oos_port"]["predictions"])].copy()
+        oos_df["oos_prediction"] = results["rolling_oos_port"]["predictions"]
+        oos_df["oos_prediction"] = oos_df.groupby("ticker_clean")["oos_prediction"].shift(1)
+
+        results["portfolio"] = run_portfolio_sorts(
+            oos_df,
+            oos_df["oos_prediction"].values,
+            target="CAR_post_primary"
+        )
 
     # --- Final model comparison ---
     log.info("\n" + "="*60)
